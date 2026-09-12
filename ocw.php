@@ -1,75 +1,97 @@
 <?php
 /**
- * OpenCart 订单快速查询 - Web 版
- * 放到 OpenCart 站点目录(与 config.php 同级,如站点根目录或 admin/)即可访问:
- *   http://yourshop/oc_order_stats_web.php?days=7
+ * OpenCart Order Stats - Web version (PHP 5.4+)
+ * Shows order counts (status > 0) by status and by country.
+ * Place next to config.php in the OpenCart web root and open:
+ *   http://yourshop/ocw.php?days=7
  *
- * 可选简单访问控制:在下面 ACCESS_TOKEN 里填一个随机串,
- * 之后必须带 ?token=xxx 访问;留空则不校验(仅建议放 admin/ 下并配合后台登录)。
+ * Optional access control: set ACCESS_TOKEN to a random string,
+ * then access requires ?token=xxx. Leave empty to disable.
+ * Add &debug=1 to display PHP errors.
  */
 
-// ---------- 访问控制(可选) ----------
-define('ACCESS_TOKEN', ''); // 例: bin2hex(random_bytes(16)) 生成的串
+error_reporting(E_ALL);
+ini_set('display_errors', '0');
+mysqli_report(MYSQLI_REPORT_OFF); // handle errors manually, no exceptions
 
-if (ACCESS_TOKEN !== '' && ($_GET['token'] ?? '') !== ACCESS_TOKEN) {
+// ---------- Access control (optional) ----------
+$ACCESS_TOKEN = '';
+
+if (isset($_GET['debug'])) {
+    ini_set('display_errors', '1');
+}
+
+if ($ACCESS_TOKEN !== '' && (!isset($_GET['token']) || $_GET['token'] !== $ACCESS_TOKEN)) {
     http_response_code(403);
     exit('Forbidden');
 }
 
-// ---------- 1. 加载 OpenCart 配置(与本文件同目录的 config.php) ----------
+// ---------- 1. Load OpenCart config ----------
 $configFile = __DIR__ . '/config.php';
 if (!is_file($configFile)) {
     http_response_code(500);
-    exit('找不到 config.php,请将本文件放到 OpenCart 站点根目录或 admin/ 目录下');
+    exit('config.php not found at ' . $configFile . ' - place this file next to it');
 }
 require $configFile;
 
-foreach (['DB_HOSTNAME', 'DB_USERNAME', 'DB_PASSWORD', 'DB_DATABASE'] as $k) {
+foreach (array('DB_HOSTNAME', 'DB_USERNAME', 'DB_PASSWORD', 'DB_DATABASE') as $k) {
     if (!defined($k)) {
         http_response_code(500);
-        exit("config.php 缺少常量 $k");
+        exit("Constant $k missing in config.php (PHP version: " . PHP_VERSION . ")");
     }
 }
 
 $prefix = defined('DB_PREFIX') ? DB_PREFIX : 'oc_';
-$days   = max(1, min(365, (int)($_GET['days'] ?? 7)));
-$langId = (int)($_GET['lang'] ?? 1); // 状态名语言,中文站一般传 &lang=2
+$days   = isset($_GET['days']) ? (int)$_GET['days'] : 7;
+if ($days < 1)   { $days = 1; }
+if ($days > 365) { $days = 365; }
+$langId = isset($_GET['lang']) ? (int)$_GET['lang'] : 1;
 
-// ---------- 2. 连接 ----------
+// ---------- 2. Connect ----------
 $db = @new mysqli(DB_HOSTNAME, DB_USERNAME, DB_PASSWORD, DB_DATABASE);
 if ($db->connect_errno) {
     http_response_code(500);
-    exit('数据库连接失败: ' . htmlspecialchars($db->connect_error));
+    exit('DB connection failed: ' . htmlspecialchars($db->connect_error)
+        . ' (host=' . DB_HOSTNAME . ', db=' . DB_DATABASE . ')');
 }
-$db->set_charset('utf8mb4');
+if (!$db->set_charset('utf8mb4')) { $db->set_charset('utf8'); }
 
-$order  = $prefix . 'order';
-$status = $prefix . 'order_status';
+$order       = $prefix . 'order';
+$statusTable = $prefix . 'order_status';
 
-function q(mysqli $db, string $sql): array {
+function q($db, $sql) {
     $res = $db->query($sql);
-    if ($res === false) { http_response_code(500); exit('SQL 错误: ' . htmlspecialchars($db->error)); }
-    return $res->fetch_all(MYSQLI_ASSOC);
+    if ($res === false) {
+        http_response_code(500);
+        exit('SQL error: ' . htmlspecialchars($db->error) . '<br>SQL: ' . htmlspecialchars($sql));
+    }
+    $rows = array();
+    if ($res !== true) {
+        while ($r = $res->fetch_assoc()) { $rows[] = $r; }
+    }
+    return $rows;
 }
 
-// ---------- 3. 查询 ----------
-$total = q($db,
-    "SELECT COUNT(*) AS cnt, COALESCE(SUM(total),0) AS amount
+// ---------- 3. Queries (counts only) ----------
+$totalRows = q($db,
+    "SELECT COUNT(*) AS cnt
      FROM `{$order}`
-     WHERE order_status_id > 0 AND date_added >= NOW() - INTERVAL {$days} DAY")[0];
+     WHERE order_status_id > 0 AND date_added >= NOW() - INTERVAL {$days} DAY");
+$total = $totalRows[0];
 
 $byStatus = q($db,
-    "SELECT o.order_status_id, COALESCE(os.name,'(未知)') AS status_name,
-            COUNT(*) AS cnt, COALESCE(SUM(o.total),0) AS amount
+    "SELECT o.order_status_id, COALESCE(os.name,'(unknown)') AS status_name,
+            COUNT(*) AS cnt
      FROM `{$order}` o
-     LEFT JOIN `{$status}` os ON os.order_status_id = o.order_status_id AND os.language_id = {$langId}
+     LEFT JOIN `{$statusTable}` os
+            ON os.order_status_id = o.order_status_id AND os.language_id = {$langId}
      WHERE o.order_status_id > 0 AND o.date_added >= NOW() - INTERVAL {$days} DAY
      GROUP BY o.order_status_id, os.name
      ORDER BY cnt DESC");
 
 $byCountry = q($db,
-    "SELECT COALESCE(NULLIF(payment_country,''),'(空)') AS country,
-            COUNT(*) AS cnt, COALESCE(SUM(o.total),0) AS amount
+    "SELECT COALESCE(NULLIF(payment_country,''),'(empty)') AS country,
+            COUNT(*) AS cnt
      FROM `{$order}`
      WHERE order_status_id > 0 AND date_added >= NOW() - INTERVAL {$days} DAY
      GROUP BY payment_country
@@ -77,19 +99,22 @@ $byCountry = q($db,
 
 $db->close();
 
-// ---------- 4. 输出 HTML ----------
+// ---------- 4. Output ----------
 header('Content-Type: text/html; charset=utf-8');
-$fmt = fn($v) => htmlspecialchars((string)$v);
+
+function h($v) { return htmlspecialchars((string)$v, ENT_QUOTES, 'UTF-8'); }
+function bar($cnt, $max) { return round($cnt / $max * 100); }
 ?>
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>订单统计 - 最近 <?= $days ?> 天</title>
+<title>Order Stats - last <?php echo (int)$days; ?> days</title>
 <style>
-  body { font-family: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif; margin: 2rem; background: #f6f7f9; color: #222; }
+  body { font-family: system-ui, "Segoe UI", Arial, sans-serif; margin: 2rem; background: #f6f7f9; color: #222; }
   h1 { font-size: 1.3rem; }
+  h2 { font-size: 1.05rem; margin: 0; }
   .card { background: #fff; border-radius: 8px; padding: 1rem 1.5rem; margin: 1rem 0; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
   .summary b { font-size: 1.6rem; }
   table { border-collapse: collapse; width: 100%; margin-top: .5rem; }
@@ -104,48 +129,53 @@ $fmt = fn($v) => htmlspecialchars((string)$v);
 </head>
 <body>
 
-<h1>OpenCart 订单统计(状态 &gt; 0,最近 <?= $days ?> 天)</h1>
+<h1>OpenCart order stats (status &gt; 0, last <?php echo (int)$days; ?> days)</h1>
 
 <form method="get">
-  <label>最近 <input type="number" name="days" value="<?= $days ?>" min="1" max="365" style="width:5rem"> 天</label>
-  <label>语言ID <input type="number" name="lang" value="<?= $langId ?>" min="1" style="width:4rem"></label>
-  <button type="submit">查询</button>
+  <label>Last <input type="number" name="days" value="<?php echo (int)$days; ?>" min="1" max="365" style="width:5rem"> days</label>
+  <label>Language ID <input type="number" name="lang" value="<?php echo (int)$langId; ?>" min="1" style="width:4rem"></label>
+  <button type="submit">Query</button>
 </form>
 
 <div class="card summary">
-  有效订单:<b><?= number_format((float)$total['cnt']) ?></b> 笔,
-  合计金额:<b><?= number_format((float)$total['amount'], 2) ?></b>
+  Valid orders: <b><?php echo number_format((float)$total['cnt']); ?></b>
 </div>
 
 <div class="card">
-  <h2>按订单状态</h2>
+  <h2>By order status</h2>
   <table>
-    <tr><th>状态</th><th class="num">笔数</th><th class="num">金额</th><th style="width:40%">&nbsp;</th></tr>
-    <?php $maxCnt = max(1, ...array_column($byStatus, 'cnt')) ?: 1; foreach ($byStatus as $r): ?>
-    <tr>
-      <td><?= $fmt($r['status_name']) ?></td>
-      <td class="num"><?= number_format((float)$r['cnt']) ?></td>
-      <td class="num"><?= number_format((float)$r['amount'], 2) ?></td>
-      <td><div class="bar" style="width: <?= round($r['cnt'] / $maxCnt * 100) ?>%"></div></td>
-    </tr>
-    <?php endforeach; if (!$byStatus) echo '<tr><td colspan="4">无数据</td></tr>'; ?>
+    <tr><th>Status</th><th class="num">Orders</th><th style="width:50%">&nbsp;</th></tr>
+    <?php
+    $maxCnt = 1;
+    foreach ($byStatus as $r) { if ((int)$r['cnt'] > $maxCnt) $maxCnt = (int)$r['cnt']; }
+    foreach ($byStatus as $r) {
+        echo '<tr><td>' . h($r['status_name']) . '</td>'
+           . '<td class="num">' . number_format((float)$r['cnt']) . '</td>'
+           . '<td><div class="bar" style="width:' . bar((int)$r['cnt'], $maxCnt) . '%"></div></td></tr>';
+    }
+    if (!$byStatus) { echo '<tr><td colspan="3">No data</td></tr>'; }
+    ?>
   </table>
 </div>
 
 <div class="card">
-  <h2>按国家(支付国家)</h2>
+  <h2>By country (payment country)</h2>
   <table>
-    <tr><th>国家</th><th class="num">笔数</th><th class="num">金额</th><th style="width:40%">&nbsp;</th></tr>
-    <?php $maxCnt = max(1, ...array_column($byCountry, 'cnt')) ?: 1; foreach ($byCountry as $r): ?>
-    <tr>
-      <td><?= $fmt($r['country']) ?></td>
-      <td class="num"><?= number_format((float)$r['cnt']) ?></td>
-      <td class="num"><?= number_format((float)$r['amount'], 2) ?></td>
-      <td><div class="bar" style="width: <?= round($r['cnt'] / $maxCnt * 100) ?>%"></div></td>
-    </tr>
-    <?php endforeach; if (!$byCountry) echo '<tr><td colspan="4">无数据</td></tr>'; ?>
+    <tr><th>Country</th><th class="num">Orders</th><th style="width:50%">&nbsp;</th></tr>
+    <?php
+    $maxCnt = 1;
+    foreach ($byCountry as $r) { if ((int)$r['cnt'] > $maxCnt) $maxCnt = (int)$r['cnt']; }
+    foreach ($byCountry as $r) {
+        echo '<tr><td>' . h($r['country']) . '</td>'
+           . '<td class="num">' . number_format((float)$r['cnt']) . '</td>'
+           . '<td><div class="bar" style="width:' . bar((int)$r['cnt'], $maxCnt) . '%"></div></td></tr>';
+    }
+    if (!$byCountry) { echo '<tr><td colspan="3">No data</td></tr>'; }
+    ?>
   </table>
 </div>
+
+<p style="color:#999;font-size:.8rem">PHP <?php echo PHP_VERSION; ?></p>
 
 </body>
 </html>
